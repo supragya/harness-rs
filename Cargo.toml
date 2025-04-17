@@ -11,7 +11,7 @@ members = [
     # "bin/node",
     # "bin/devtest",
 
-    "crates/metrics",
+    "crates/harness",
     # "crates/constants",
     # "crates/precompiles/consensus-verifier",
 ]
