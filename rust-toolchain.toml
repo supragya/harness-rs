@@ -1,0 +1,7 @@
+[toolchain]
+# This may need to update from time to time
+# Please refer here: https://releases.rs/
+# for upgrading
+channel = "stable-2025-03-18"
+components = ["rustfmt", "rust-src", "clippy"]
+profile = "minimal"
