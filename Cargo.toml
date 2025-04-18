@@ -8,16 +8,12 @@ exclude = [".github/"]
 
 [workspace]
 members = [
-    # "bin/node",
-    # "bin/devtest",
-
     "crates/harness",
-    # "crates/constants",
-    # "crates/precompiles/consensus-verifier",
 ]
 resolver = "3"
 
 [workspace.dependencies]
+tokio = { version = "1.34", features = ["full"] }
 
 [workspace.lints]
 rust.missing_debug_implementations = "warn"
