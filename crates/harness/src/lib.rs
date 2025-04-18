@@ -1,25 +1,45 @@
+use std::fmt::Debug;
 use std::future::Future;
 use std::process::{Child, Command};
 use std::time::Duration;
 
+use log::{error, info};
+
 /// A single step of a test
+#[derive(Debug)]
 pub enum TestStep {
-    /// A step that executes over services, such as starting or stopping a service
+    /// A step that executes over services, such as starting or stopping a
+    /// service
     Service(Box<dyn ServiceStepExecutor<StepError = String>>),
     /// A step that executes an async function
-    AsyncFn(Box<dyn FnOnce() -> Box<dyn Future<Output = Result<(), String>>>>),
+    AsyncFn(Box<AsyncFnStep>),
+}
+
+pub struct AsyncFnStep {
+    pub name: String,
+    pub description: String,
+    pub futurefn: Box<dyn FnOnce() -> Box<dyn Future<Output = Result<(), String>>>>,
+}
+
+impl Debug for AsyncFnStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AsyncFnStep")
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .finish()
+    }
 }
 
 /// A harness for running tests with services
 /// It manages the lifecycle of services and executes test steps
-pub struct Harness {
+pub struct TestHarness {
     pub test_name: String,
     pub root_dir: String,
     pub services: Vec<Box<dyn Service<ServiceError = String>>>,
     pub steps: Vec<TestStep>,
 }
 
-impl Harness {
+impl TestHarness {
     pub fn new(test_name: &str, root_dir: &str) -> Self {
         Self {
             test_name: test_name.to_string(),
@@ -36,23 +56,40 @@ impl Harness {
     pub fn add_step(&mut self, step: TestStep) { self.steps.push(step); }
 
     pub fn execute(mut self) -> Result<(), String> {
-        for step in self.steps {
-            match step {
-                TestStep::Service(step_executor) => {
-                    step_executor.execute(self.services.as_mut_slice())?;
+        info!(
+            "Executing test: {} with rootdir: {}",
+            self.test_name, self.root_dir
+        );
+        let total_steps = self.steps.len();
+        for (idx, step) in self.steps.into_iter().enumerate() {
+            info!("Executing step {}/{}:\n   {:?}", idx + 1, total_steps, step);
+            let result = match step {
+                TestStep::Service(step_executor) =>
+                    step_executor.execute(self.services.as_mut_slice()),
+                TestStep::AsyncFn(async_step) => tokio::runtime::Runtime::new()
+                    .map_err(|e| format!("Failed to create runtime: {}", e))?
+                    .block_on(Box::into_pin((async_step.futurefn)())),
+            };
+            if let Err(e) = result {
+                error!("Step execution failed: {}", e);
+                for service in self.services.iter_mut().rev() {
+                    if service.is_running() {
+                        match service.stop() {
+                            Ok(_) => info!("Service {:?} stopped successfully", service),
+                            Err(e) => error!("Failed to stop service {:?}: {}", service, e),
+                        }
+                    }
                 }
-                TestStep::AsyncFn(future) => {
-                    let _ = tokio::runtime::Runtime::new()
-                        .map_err(|e| format!("Failed to create runtime: {}", e))?
-                        .block_on(Box::into_pin(future()));
-                }
+            } else {
+                info!("Step executed successfully: {}/{}", idx + 1, total_steps);
             }
         }
+        info!("Test execution completed for {}", self.test_name);
         Ok(())
     }
 }
 
-pub trait ServiceStepExecutor {
+pub trait ServiceStepExecutor: Debug {
     type StepError;
     fn execute(
         &self,
@@ -65,6 +102,15 @@ pub struct SubProcessServiceStarter {
     pub description: String,
     pub service_idx: usize,
     pub wait_after: Option<Duration>,
+}
+
+impl Debug for SubProcessServiceStarter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubProcessServiceStarter")
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .finish()
+    }
 }
 
 impl ServiceStepExecutor for SubProcessServiceStarter {
@@ -97,6 +143,15 @@ pub struct SubProcessServiceStopper {
     pub wait_after: Option<Duration>,
 }
 
+impl Debug for SubProcessServiceStopper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubProcessServiceStopper")
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .finish()
+    }
+}
+
 impl ServiceStepExecutor for SubProcessServiceStopper {
     type StepError = String;
 
@@ -113,14 +168,14 @@ impl ServiceStepExecutor for SubProcessServiceStopper {
         service
             .stop()
             .map_err(|e| format!("Failed to stop service '{}': {}", self.name, e))?;
-        if let Some(wait_duration) = self.wait_after {  
+        if let Some(wait_duration) = self.wait_after {
             std::thread::sleep(wait_duration);
         }
         Ok(())
     }
 }
 
-pub trait Service {
+pub trait Service: Debug {
     type ServiceError;
     fn start(&mut self) -> Result<(), Self::ServiceError>;
     fn is_running(&self) -> bool;
@@ -132,6 +187,14 @@ pub struct SubProcessService {
     pub command: String,
     pub args: Vec<String>,
     pub child: Option<Child>,
+}
+
+impl Debug for SubProcessService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubProcessService")
+            .field("name", &self.name)
+            .finish()
+    }
 }
 
 impl Service for SubProcessService {
@@ -156,17 +219,13 @@ impl Service for SubProcessService {
     fn is_running(&self) -> bool { self.child.is_some() }
 
     fn stop(&mut self) -> Result<(), String> {
-        if !self.is_running() {
-            return Err(format!("Subprocess '{}' is not running", self.name));
-        }
         if let Some(mut child) = self.child.take() {
-            match child.kill() {
+            return match child.kill() {
                 Ok(_) => Ok(()),
                 Err(e) => Err(format!("Failed to stop subprocess '{}': {}", self.name, e)),
-            }
-        } else {
-            Err(format!("Subprocess '{}' is not running", self.name))
+            };
         }
+        Ok(())
     }
 }
 
@@ -175,8 +234,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_start_callapi_stop_python_servef() {
-        let mut harness = Harness::new("PythonServerTester", ".");
+    fn test_start_callapi_stop_python_serve() {
+        env_logger::init();
+        let mut harness = TestHarness::new("PythonServerTester", ".");
 
         harness.add_service(Box::new(SubProcessService {
             name: "Python_HTTP_Service".to_string(),
@@ -184,7 +244,7 @@ mod tests {
             args: vec![
                 "-m".to_string(),
                 "http.server".to_string(),
-                "8081".to_string(),
+                "12345".to_string(),
             ],
             child: None,
         }));
@@ -196,20 +256,24 @@ mod tests {
             wait_after: Some(Duration::from_secs(2)),
         })));
 
-        harness.add_step(TestStep::AsyncFn(Box::new(|| {
-            Box::new(async {
-                let response = reqwest::get("http://localhost:8081").await;
+        harness.add_step(TestStep::AsyncFn(Box::new(AsyncFnStep {
+            name: "Call_API".to_string(),
+            description: "Check API response being 200".to_string(),
+            futurefn: Box::new(|| {
+                Box::new(async {
+                    let response = reqwest::get("http://localhost:12345").await;
 
-                match response {
-                    Ok(resp) =>
-                        if resp.status() == 200 {
-                            Ok(())
-                        } else {
-                            Err(format!("API call failed: Status code {}", resp.status()))
-                        },
-                    Err(e) => Err(format!("Failed to make API call: {}", e)),
-                }
-            })
+                    match response {
+                        Ok(resp) =>
+                            if resp.status() == 200 {
+                                Ok(())
+                            } else {
+                                Err(format!("API call failed: Status code {}", resp.status()))
+                            },
+                        Err(e) => Err(format!("Failed to make API call: {}", e)),
+                    }
+                })
+            }),
         })));
 
         harness.add_step(TestStep::Service(Box::new(SubProcessServiceStopper {
